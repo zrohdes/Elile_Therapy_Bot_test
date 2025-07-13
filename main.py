@@ -1,381 +1,427 @@
-import streamlit as st
 import asyncio
 import base64
 import datetime
 import os
+import httpx
+import streamlit as st
 import threading
-import queue
-import time
-from typing import Dict, Any, Optional
+import requests
+import re
 from dotenv import load_dotenv
 from hume.client import AsyncHumeClient
 from hume.empathic_voice.chat.socket_client import ChatConnectOptions
 from hume.empathic_voice.chat.types import SubscribeEvent
 from hume import MicrophoneInterface, Stream
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 
-# Page config
-st.set_page_config(
-    page_title="Hume Voice Chat",
-    page_icon="🎙️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Disable SSL verification for corporate networks
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['CURL_CA_BUNDLE'] = ''
+
+
+def translate_text(text, target_lang='ar'):
+    """Simple translation using Google Translate API"""
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            'client': 'gtx',
+            'sl': 'auto',
+            'tl': target_lang,
+            'dt': 't',
+            'q': text
+        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            result = response.json()
+            if result and result[0]:
+                return ''.join([item[0] for item in result[0] if item and item[0]]).strip()
+    except:
+        pass
+    return "Translation unavailable"
+
+
+def is_arabic(text):
+    """Check if text contains Arabic characters"""
+    arabic_pattern = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]')
+    arabic_chars = len(arabic_pattern.findall(text))
+    total_chars = len([c for c in text if c.isalpha()])
+    return total_chars > 0 and arabic_chars / total_chars > 0.3
 
 
 class StreamlitWebSocketHandler:
-    def __init__(self):
+    def __init__(self, input_language='auto'):
         self.byte_strs = Stream.new()
-        self.messages = []
-        self.emotion_scores = {}
-        self.chat_metadata = {}
+        self.chat_history = []
         self.is_connected = False
-        self.error_message = None
+        self.input_language = input_language
+
+    def set_input_language(self, language):
+        self.input_language = language
 
     async def on_open(self):
         self.is_connected = True
-        self._log_message("WebSocket connection opened.", "system")
+        self.chat_history.append({
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "type": "system",
+            "message": "Connection established. You can start speaking now."
+        })
 
     async def on_message(self, message: SubscribeEvent):
-        try:
-            if message.type == "chat_metadata":
-                self.chat_metadata = {
-                    "chat_id": message.chat_id,
-                    "chat_group_id": message.chat_group_id
-                }
-                self._log_message(f"Chat ID: {message.chat_id}", "metadata")
-                return
+        timestamp = datetime.datetime.now(tz=datetime.timezone.utc)
 
-            elif message.type == "user_message" or message.type == "assistant_message":
-                msg_content = {
-                    "role": message.message.role,
-                    "content": message.message.content,
-                    "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
-                    "emotions": None
-                }
+        if message.type == "user_message":
+            emotions = self._extract_top_n_emotions(dict(message.models.prosody.scores),
+                                                    3) if message.models.prosody else {}
+            text = message.message.content.strip()
 
-                if message.models.prosody is not None:
-                    emotions = self._extract_top_n_emotions(
-                        dict(message.models.prosody.scores), 5
-                    )
-                    msg_content["emotions"] = emotions
-                    self.emotion_scores = emotions
-
-                self.messages.append(msg_content)
-                return
-
-            elif message.type == "audio_output":
-                await self.byte_strs.put(
-                    base64.b64decode(message.data.encode("utf-8"))
-                )
-                return
-
-            elif message.type == "error":
-                self.error_message = f"Hume API Error ({message.code}): {message.message}"
-                self._log_message(self.error_message, "error")
-                return
-
+            # Determine language
+            if self.input_language == 'auto':
+                detected_is_arabic = is_arabic(text)
             else:
-                self._log_message(f"Received {message.type} event", "system")
+                detected_is_arabic = self.input_language == 'ar'
 
-        except Exception as e:
-            self.error_message = f"Handler error: {str(e)}"
-            self._log_message(self.error_message, "error")
+            # Create chat entry
+            chat_entry = {
+                "timestamp": timestamp,
+                "type": "user",
+                "message": text,
+                "emotions": emotions,
+                "original_language": "arabic" if detected_is_arabic else "english"
+            }
+
+            # Add translation
+            if detected_is_arabic:
+                chat_entry["english_translation"] = translate_text(text, 'en')
+            else:
+                chat_entry["arabic_translation"] = translate_text(text, 'ar')
+
+            self.chat_history.append(chat_entry)
+
+        elif message.type == "assistant_message":
+            emotions = self._extract_top_n_emotions(dict(message.models.prosody.scores),
+                                                    3) if message.models.prosody else {}
+            self.chat_history.append({
+                "timestamp": timestamp,
+                "type": "assistant",
+                "message": message.message.content,
+                "emotions": emotions
+            })
+
+        elif message.type == "audio_output":
+            await self.byte_strs.put(base64.b64decode(message.data.encode("utf-8")))
+
+        elif message.type == "error":
+            self.chat_history.append({
+                "timestamp": timestamp,
+                "type": "error",
+                "message": f"Error ({message.code}): {message.message}"
+            })
+            raise RuntimeError(f"Received error message from Hume websocket ({message.code}): {message.message}")
 
     async def on_close(self):
         self.is_connected = False
-        self._log_message("WebSocket connection closed.", "system")
+        self.chat_history.append({
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "type": "system",
+            "message": "Connection closed."
+        })
 
     async def on_error(self, error):
-        self.error_message = f"WebSocket error: {str(error)}"
-        self._log_message(self.error_message, "error")
-
-    def _log_message(self, text: str, msg_type: str) -> None:
-        timestamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%H:%M:%S")
-        log_entry = {
-            "timestamp": timestamp,
-            "message": text,
-            "type": msg_type
-        }
-        if not hasattr(self, 'logs'):
-            self.logs = []
-        self.logs.append(log_entry)
+        self.chat_history.append({
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "type": "error",
+            "message": f"Error: {error}"
+        })
 
     def _extract_top_n_emotions(self, emotion_scores: dict, n: int) -> dict:
         sorted_emotions = sorted(emotion_scores.items(), key=lambda item: item[1], reverse=True)
         return {emotion: score for emotion, score in sorted_emotions[:n]}
 
+    def get_chat_history(self):
+        return self.chat_history
 
-class HumeVoiceChatApp:
-    def __init__(self):
-        self.handler = None
-        self.client = None
-        self.chat_task = None
-        self.is_running = False
 
-    def initialize_session_state(self):
-        """Initialize Streamlit session state variables."""
-        if 'handler' not in st.session_state:
-            st.session_state.handler = StreamlitWebSocketHandler()
-        if 'is_connected' not in st.session_state:
-            st.session_state.is_connected = False
-        if 'chat_started' not in st.session_state:
-            st.session_state.chat_started = False
+async def run_voice_chat(handler, api_key, secret_key, config_id):
+    custom_client = httpx.AsyncClient(verify=False, timeout=30.0)
+    client = AsyncHumeClient(api_key=api_key, httpx_client=custom_client)
+    options = ChatConnectOptions(config_id=config_id, secret_key=secret_key)
 
-    def render_sidebar(self):
-        """Render the sidebar with configuration and controls."""
-        st.sidebar.title("🎙️ Hume Voice Chat")
-        st.sidebar.markdown("---")
-
-        # API Configuration
-        st.sidebar.subheader("API Configuration")
-
-        # Load environment variables
-        load_dotenv()
-
-        api_key = st.sidebar.text_input(
-            "Hume API Key",
-            value=os.getenv("HUME_API_KEY", ""),
-            type="password",
-            help="Your Hume API key"
-        )
-
-        secret_key = st.sidebar.text_input(
-            "Hume Secret Key",
-            value=os.getenv("HUME_SECRET_KEY", ""),
-            type="password",
-            help="Your Hume secret key"
-        )
-
-        config_id = st.sidebar.text_input(
-            "Hume Config ID",
-            value=os.getenv("HUME_CONFIG_ID", ""),
-            help="Your Hume configuration ID"
-        )
-
-        st.sidebar.markdown("---")
-
-        # Connection Controls
-        st.sidebar.subheader("Connection Controls")
-
-        if not st.session_state.chat_started:
-            if st.sidebar.button("🚀 Start Voice Chat", type="primary"):
-                if api_key and secret_key and config_id:
-                    self.start_chat(api_key, secret_key, config_id)
-                else:
-                    st.sidebar.error("Please provide all required API credentials")
-        else:
-            if st.sidebar.button("🛑 Stop Voice Chat", type="secondary"):
-                self.stop_chat()
-
-        # Connection Status
-        st.sidebar.subheader("Connection Status")
-        if st.session_state.is_connected:
-            st.sidebar.success("🟢 Connected")
-        elif st.session_state.chat_started:
-            st.sidebar.warning("🟡 Connecting...")
-        else:
-            st.sidebar.error("🔴 Disconnected")
-
-        # Chat Metadata
-        if hasattr(st.session_state.handler, 'chat_metadata') and st.session_state.handler.chat_metadata:
-            st.sidebar.subheader("Chat Info")
-            metadata = st.session_state.handler.chat_metadata
-            st.sidebar.text(f"Chat ID: {metadata.get('chat_id', 'N/A')}")
-            st.sidebar.text(f"Group ID: {metadata.get('chat_group_id', 'N/A')}")
-
-    def start_chat(self, api_key: str, secret_key: str, config_id: str):
-        """Start the voice chat session."""
-        try:
-            st.session_state.chat_started = True
-            st.session_state.handler = StreamlitWebSocketHandler()
-
-            # Start the chat in a separate thread
-            def run_chat():
-                asyncio.run(self._chat_loop(api_key, secret_key, config_id))
-
-            chat_thread = threading.Thread(target=run_chat, daemon=True)
-            chat_thread.start()
-
-            st.sidebar.success("Voice chat started! Please allow microphone access.")
-
-        except Exception as e:
-            st.sidebar.error(f"Failed to start chat: {str(e)}")
-            st.session_state.chat_started = False
-
-    def stop_chat(self):
-        """Stop the voice chat session."""
-        st.session_state.chat_started = False
-        st.session_state.is_connected = False
-        st.sidebar.info("Voice chat stopped.")
-
-    async def _chat_loop(self, api_key: str, secret_key: str, config_id: str):
-        """Main chat loop running in async context."""
-        try:
-            client = AsyncHumeClient(api_key=api_key)
-            options = ChatConnectOptions(config_id=config_id, secret_key=secret_key)
-
-            async with client.empathic_voice.chat.connect_with_callbacks(
-                    options=options,
-                    on_open=st.session_state.handler.on_open,
-                    on_message=st.session_state.handler.on_message,
-                    on_close=st.session_state.handler.on_close,
-                    on_error=st.session_state.handler.on_error
-            ) as socket:
-                st.session_state.is_connected = True
-
-                await asyncio.create_task(
-                    MicrophoneInterface.start(
-                        socket,
-                        allow_user_interrupt=False,
-                        byte_stream=st.session_state.handler.byte_strs
-                    )
-                )
-
-        except Exception as e:
-            st.session_state.handler.error_message = f"Chat loop error: {str(e)}"
-            st.session_state.is_connected = False
-
-    def render_main_content(self):
-        """Render the main content area."""
-        st.title("🎙️ Hume Empathic Voice Chat")
-        st.markdown("Real-time voice chat with emotion detection powered by Hume AI")
-
-        # Create tabs for different views
-        tab1, tab2, tab3 = st.tabs(["💬 Chat", "📊 Emotions", "📝 Logs"])
-
-        with tab1:
-            self.render_chat_tab()
-
-        with tab2:
-            self.render_emotions_tab()
-
-        with tab3:
-            self.render_logs_tab()
-
-    def render_chat_tab(self):
-        """Render the chat messages tab."""
-        st.subheader("Conversation")
-
-        # Display error if any
-        if hasattr(st.session_state.handler, 'error_message') and st.session_state.handler.error_message:
-            st.error(st.session_state.handler.error_message)
-
-        # Display chat messages
-        if hasattr(st.session_state.handler, 'messages') and st.session_state.handler.messages:
-            for msg in st.session_state.handler.messages[-10:]:  # Show last 10 messages
-                timestamp = msg['timestamp'].strftime("%H:%M:%S")
-                role = msg['role']
-                content = msg['content']
-
-                # Style based on role
-                if role == "user":
-                    st.markdown(f"**🗣️ You** ({timestamp})")
-                    st.markdown(f"*{content}*")
-                else:
-                    st.markdown(f"**🤖 Assistant** ({timestamp})")
-                    st.markdown(content)
-
-                # Display emotions if available
-                if msg.get('emotions'):
-                    emotions_text = " | ".join([
-                        f"{emotion}: {score:.2f}"
-                        for emotion, score in msg['emotions'].items()
-                    ])
-                    st.caption(f"Emotions: {emotions_text}")
-
-                st.markdown("---")
-        else:
-            st.info("Start a voice chat to see the conversation here.")
-
-    def render_emotions_tab(self):
-        """Render the emotions visualization tab."""
-        st.subheader("Emotion Analysis")
-
-        if hasattr(st.session_state.handler, 'emotion_scores') and st.session_state.handler.emotion_scores:
-            # Current emotions bar chart
-            emotions = list(st.session_state.handler.emotion_scores.keys())
-            scores = list(st.session_state.handler.emotion_scores.values())
-
-            fig = px.bar(
-                x=emotions,
-                y=scores,
-                title="Current Emotion Scores",
-                labels={'x': 'Emotions', 'y': 'Score'},
-                color=scores,
-                color_continuous_scale='viridis'
+    try:
+        async with client.empathic_voice.chat.connect_with_callbacks(
+                options=options,
+                on_open=handler.on_open,
+                on_message=handler.on_message,
+                on_close=handler.on_close,
+                on_error=handler.on_error
+        ) as socket:
+            await asyncio.create_task(
+                MicrophoneInterface.start(socket, allow_user_interrupt=False, byte_stream=handler.byte_strs)
             )
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        handler.chat_history.append({
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "type": "error",
+            "message": f"Connection error: {e}"
+        })
+    finally:
+        await custom_client.aclose()
 
-            # Emotion scores over time
-            if hasattr(st.session_state.handler, 'messages') and st.session_state.handler.messages:
-                emotion_history = []
-                for msg in st.session_state.handler.messages:
-                    if msg.get('emotions'):
-                        for emotion, score in msg['emotions'].items():
-                            emotion_history.append({
-                                'timestamp': msg['timestamp'],
-                                'emotion': emotion,
-                                'score': score,
-                                'role': msg['role']
-                            })
 
-                if emotion_history:
-                    import pandas as pd
-                    df = pd.DataFrame(emotion_history)
+def run_async_chat(handler, api_key, secret_key, config_id):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_voice_chat(handler, api_key, secret_key, config_id))
+    finally:
+        loop.close()
 
-                    # Line chart for emotion trends
-                    fig_line = px.line(
-                        df,
-                        x='timestamp',
-                        y='score',
-                        color='emotion',
-                        title='Emotion Trends Over Time',
-                        labels={'timestamp': 'Time', 'score': 'Emotion Score'}
-                    )
-                    st.plotly_chart(fig_line, use_container_width=True)
+
+def main():
+    st.set_page_config(page_title="Hume AI Voice Chat", page_icon="🎙️", layout="wide")
+
+    # Initialize session
+    if 'session_initialized' not in st.session_state:
+        if 'websocket_handler' in st.session_state:
+            del st.session_state.websocket_handler
+        if 'chat_thread' in st.session_state:
+            del st.session_state.chat_thread
+        if 'input_language' not in st.session_state:
+            st.session_state.input_language = 'auto'
+        st.session_state.session_initialized = True
+
+    # Custom CSS
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+    .main-header {
+        text-align: center;
+        color: #1f2937;
+        font-weight: 600;
+        margin-bottom: 40px;
+        font-size: 2.5rem;
+    }
+
+    .chat-container {
+        padding: 24px;
+        border-radius: 12px;
+        margin: 16px 0;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        border: 1px solid #e5e7eb;
+    }
+
+    .user-message {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        margin-left: 20%;
+    }
+
+    .assistant-message {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: white;
+        margin-right: 20%;
+    }
+
+    .system-message {
+        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        color: white;
+        text-align: center;
+        margin: 8px 0;
+        padding: 12px;
+        font-size: 0.9rem;
+    }
+
+    .error-message {
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+        color: white;
+        border: 1px solid #ff4757;
+    }
+
+    .timestamp {
+        font-size: 0.75rem;
+        opacity: 0.8;
+        margin-bottom: 8px;
+        font-weight: 300;
+    }
+
+    .message-content {
+        font-size: 1rem;
+        line-height: 1.6;
+        margin-bottom: 12px;
+        font-weight: 400;
+        white-space: pre-line;
+    }
+
+    .arabic-text {
+        direction: rtl;
+        text-align: right;
+    }
+
+    .role-label {
+        font-weight: 600;
+        font-size: 0.9rem;
+        opacity: 0.9;
+        margin-bottom: 4px;
+    }
+
+    .status-indicator {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 8px;
+    }
+
+    .status-connected {
+        background-color: #10b981;
+        box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+    }
+
+    .status-disconnected {
+        background-color: #ef4444;
+        box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Load environment variables
+    load_dotenv()
+    api_key = os.getenv("HUME_API_KEY")
+    secret_key = os.getenv("HUME_SECRET_KEY")
+    config_id = os.getenv("HUME_CONFIG_ID")
+
+    # Header
+    st.markdown("<h1 class='main-header'>Hume AI Voice Chat</h1>", unsafe_allow_html=True)
+
+    # Controls
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+
+    with col1:
+        if 'websocket_handler' in st.session_state and st.session_state.websocket_handler.is_connected:
+            st.markdown("""
+            <div style="display: flex; align-items: center; font-weight: 500; color: #059669;">
+                <span class="status-indicator status-connected"></span>
+                Connected - Voice chat active
+            </div>
+            """, unsafe_allow_html=True)
         else:
-            st.info("Start a voice chat to see emotion analysis here.")
+            st.markdown("""
+            <div style="display: flex; align-items: center; font-weight: 500; color: #dc2626;">
+                <span class="status-indicator status-disconnected"></span>
+                Disconnected
+            </div>
+            """, unsafe_allow_html=True)
 
-    def render_logs_tab(self):
-        """Render the system logs tab."""
-        st.subheader("System Logs")
+    with col2:
+        language_options = {'auto': 'Auto Detect', 'en': 'English', 'ar': 'Arabic'}
+        selected_language = st.selectbox(
+            "Input Language",
+            options=list(language_options.keys()),
+            format_func=lambda x: language_options[x],
+            index=list(language_options.keys()).index(st.session_state.input_language),
+            key="language_selector"
+        )
 
-        if hasattr(st.session_state.handler, 'logs') and st.session_state.handler.logs:
-            # Display logs in reverse chronological order
-            for log in reversed(st.session_state.handler.logs[-50:]):  # Show last 50 logs
-                timestamp = log['timestamp']
-                message = log['message']
-                log_type = log['type']
+        if selected_language != st.session_state.input_language:
+            st.session_state.input_language = selected_language
+            if 'websocket_handler' in st.session_state:
+                st.session_state.websocket_handler.set_input_language(selected_language)
 
-                # Style based on log type
-                if log_type == "error":
-                    st.error(f"[{timestamp}] {message}")
-                elif log_type == "system":
-                    st.info(f"[{timestamp}] {message}")
-                elif log_type == "metadata":
-                    st.success(f"[{timestamp}] {message}")
-                else:
-                    st.text(f"[{timestamp}] {message}")
-        else:
-            st.info("System logs will appear here when you start the chat.")
+    with col3:
+        if st.button("Start Voice Chat", disabled=not all([api_key, secret_key, config_id]), use_container_width=True):
+            if 'websocket_handler' not in st.session_state:
+                st.session_state.websocket_handler = StreamlitWebSocketHandler(st.session_state.input_language)
+            else:
+                st.session_state.websocket_handler.set_input_language(st.session_state.input_language)
 
-    def run(self):
-        """Main app entry point."""
-        self.initialize_session_state()
-        self.render_sidebar()
-        self.render_main_content()
+            if 'chat_thread' not in st.session_state or not st.session_state.chat_thread.is_alive():
+                st.session_state.chat_thread = threading.Thread(
+                    target=run_async_chat,
+                    args=(st.session_state.websocket_handler, api_key, secret_key, config_id)
+                )
+                st.session_state.chat_thread.daemon = True
+                st.session_state.chat_thread.start()
+                st.success("Voice chat started!")
+                st.rerun()
 
-        # Auto-refresh every 2 seconds when chat is active
-        if st.session_state.chat_started:
-            time.sleep(2)
+    with col4:
+        if st.button("New Chat", use_container_width=True):
+            if 'websocket_handler' in st.session_state:
+                st.session_state.websocket_handler.chat_history = []
+            st.success("New conversation started!")
             st.rerun()
 
+    # Chat display
+    st.markdown("### Conversation")
 
-# Run the app
+    if 'websocket_handler' in st.session_state:
+        chat_history = st.session_state.websocket_handler.get_chat_history()
+
+        if chat_history:
+            for entry in chat_history:
+                timestamp_str = entry['timestamp'].strftime("%H:%M:%S")
+
+                if entry['type'] == 'user':
+                    css_class = "chat-container user-message"
+                    role = "You"
+                elif entry['type'] == 'assistant':
+                    css_class = "chat-container assistant-message"
+                    role = "AI Assistant"
+                elif entry['type'] == 'system':
+                    css_class = "chat-container system-message"
+                    role = "System"
+                elif entry['type'] == 'error':
+                    css_class = "chat-container error-message"
+                    role = "Error"
+                else:
+                    css_class = "chat-container"
+                    role = entry['type'].title()
+
+                # Build message content
+                message_content = entry['message']
+
+                # Add translation for user messages
+                if entry['type'] == 'user':
+                    if entry.get('original_language') == 'arabic' and 'english_translation' in entry:
+                        message_content += f"\n\nEnglish: {entry['english_translation']}"
+                    elif entry.get('original_language') == 'english' and 'arabic_translation' in entry:
+                        message_content += f"\n\nArabic: {entry['arabic_translation']}"
+
+                # Add emotions
+                if 'emotions' in entry and entry['emotions']:
+                    emotion_text = ' • '.join([f"{emotion.replace('_', ' ').title()}: {score:.2f}" for emotion, score in
+                                               entry['emotions'].items()])
+                    message_content += f"\n\nEmotions: {emotion_text}"
+
+                # Apply Arabic text styling
+                message_class = "message-content"
+                if entry['type'] == 'user' and entry.get('original_language') == 'arabic':
+                    message_class += " arabic-text"
+
+                # Display message
+                message_html = f"""
+                <div class="{css_class}">
+                    <div class="timestamp">{timestamp_str}</div>
+                    <div class="role-label">{role}</div>
+                    <div class="{message_class}">{message_content}</div>
+                </div>
+                """
+
+                st.markdown(message_html, unsafe_allow_html=True)
+        else:
+            st.info("No conversation yet. Click 'Start Voice Chat' to begin speaking with the AI.")
+    else:
+        st.info("Click 'Start Voice Chat' to initialize the voice interface.")
+
+    # Auto-refresh
+    if 'websocket_handler' in st.session_state and st.session_state.websocket_handler.is_connected:
+        import time
+        time.sleep(2)
+        st.rerun()
+
+
 if __name__ == "__main__":
-    app = HumeVoiceChatApp()
-    app.run()
+    main()
